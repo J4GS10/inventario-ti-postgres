@@ -1,0 +1,35 @@
+# Secretos del entorno de revisión local
+herramientas-qa/revision.env
+.env
+.env.*
+!.env.example
+
+# Datos reales del inventario (no se versionan)
+dataset/
+
+# Salidas locales
+graphify-out/
+herramientas-qa/shots/
+herramientas-qa/salidas/
+*.log
+__pycache__/
+.pytest_cache/
+node_modules/
+dist/
+
+# Respaldos locales del stack
+inventarioTI-backend/deploy/backups/
+inventarioTI-backend/deploy/backups-revision/
+inventarioTI-backend/deploy/replica/
+inventarioTI-backend/deploy/backup/rclone.conf
+
+# Notas locales de sesiones y planes de trabajo (no forman parte del producto)
+CONTINUAR.md
+ESTADO_*.md
+PROGRESS.md
+PROMPT_QA.md
+INFORME_EJECUTIVO_Y_PLAN.md
+PLAN_*.md
+herramientas-qa/INFORME_QA.md
+inventarioTI-backend/SESSION_PROGRESS.md
+inventarioTI-backend/implementation_plan.md

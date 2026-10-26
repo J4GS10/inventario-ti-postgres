@@ -1,0 +1,91 @@
+from typing import Optional, List
+from pydantic import BaseModel, Field, ConfigDict
+from app.schemas.common import Esquema
+from datetime import datetime
+from decimal import Decimal
+import uuid
+
+from app.core.currency import DEFAULT_CURRENCY, CurrencyCode
+
+# --- TIPO MANTENIMIENTO ---
+class TipoMantenimientoBase(Esquema):
+    TMA_Nombre: str = Field(..., min_length=3, max_length=50)
+
+class TipoMantenimientoCreate(TipoMantenimientoBase):
+    pass
+
+class TipoMantenimientoUpdate(Esquema):
+    TMA_Nombre: Optional[str] = Field(None, min_length=3, max_length=50)
+
+class TipoMantenimientoResponse(TipoMantenimientoBase):
+    TMA_Tipo_Mantenimiento: int
+    model_config = ConfigDict(from_attributes=True)
+
+# --- DETALLE (ITEMS) ---
+class DetalleMantenimientoBase(Esquema):
+    DMA_Accion_Realizada: str = Field(..., max_length=255)
+    DMA_Costo_Item: Decimal = Field(default=0, ge=0)
+    # Acción del catálogo; DMA_Accion_Realizada queda como el detalle escrito.
+    AMA_Accion: Optional[int] = None
+
+class DetalleCreate(DetalleMantenimientoBase):
+    # Con acción del catálogo el detalle es opcional (se usa su nombre).
+    DMA_Accion_Realizada: str = Field("", max_length=255)
+
+class DetalleResponse(DetalleMantenimientoBase):
+    DMA_Detalle_Mant: int
+    model_config = ConfigDict(from_attributes=True)
+
+# --- MANTENIMIENTO (CABECERA) ---
+class MantenimientoBase(Esquema):
+    ACT_Activo: uuid.UUID
+    PER_Persona_Solicita: uuid.UUID
+    TMA_Tipo_Mantenimiento: int
+    MAN_Descripcion_Falla: str
+    # Tipo de falla del catálogo; MAN_Descripcion_Falla queda como el detalle.
+    TFA_Tipo_Falla: Optional[int] = None
+    MAN_Costo_Total: Decimal = Field(default=0, ge=0)
+    # Moneda del ticket (aplica al total y a los detalles).
+    MAN_Moneda: CurrencyCode = DEFAULT_CURRENCY
+
+class MantenimientoCreate(MantenimientoBase):
+    # Cota de longitud SOLO en la entrada (la base queda laxa para que los
+    # Response no fallen ante descripciones legadas largas en BD).
+    MAN_Descripcion_Falla: str = Field("", max_length=2000)
+    # Lista opcional de acciones realizadas
+    detalles: List[DetalleCreate] = []
+
+class MantenimientoCierre(Esquema):
+    MAN_Costo_Total: Decimal = Field(..., ge=0)
+    # Si se omite, se conserva la moneda con que se abrió el ticket.
+    MAN_Moneda: Optional[CurrencyCode] = None
+    MAN_Fecha_Cierre: Optional[datetime] = None
+
+
+class ActivoMantSummary(Esquema):
+    ACT_Activo: uuid.UUID
+    ACT_Codigo_Interno: str
+    ACT_Hostname: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PersonaMantSummary(Esquema):
+    PER_Persona: uuid.UUID
+    PER_Primer_Nombre: str
+    PER_Primer_Apellido: str
+    PER_Email_Corporativo: str
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MantenimientoResponse(MantenimientoBase):
+    MAN_Mantenimiento: uuid.UUID
+    MAN_Fecha_Ingreso: datetime
+    MAN_Fecha_Cierre: Optional[datetime] = None
+
+    # Relaciones cargadas
+    tipo_mantenimiento: Optional[TipoMantenimientoResponse] = None
+    detalles: List[DetalleResponse] = []
+    activo: Optional[ActivoMantSummary] = None
+    persona_solicita: Optional[PersonaMantSummary] = None
+
+    model_config = ConfigDict(from_attributes=True)

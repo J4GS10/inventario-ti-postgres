@@ -1,0 +1,94 @@
+"""
+Limiter compartido (evita imports circulares main <-> endpoints).
+
+SEGURIDAD — Política de IP de cliente:
+El backend está detrás de Caddy → Nginx → backend. `request.client.host` siempre
+es la IP del contenedor Nginx, así que usar `get_remote_address` haría que el
+rate-limit fuera GLOBAL en vez de por-cliente.
+
+NO confiamos en `X-Forwarded-For` "tal cual" porque históricamente nginx
+anexaba a esa cabecera (`$proxy_add_x_forwarded_for`) lo que el cliente
+enviara, permitiendo a un atacante spoofear el leftmost IP y burlar el rate
+limit del login rotando IPs falsas.
+
+La política actual:
+  1. Preferimos `X-Real-IP` → nginx la SOBREESCRIBE con `$remote_addr` (la IP
+     del peer real, que es Caddy). Es un único valor controlado por nginx.
+  2. Como fallback usamos el ÚLTIMO valor de `X-Forwarded-For` (el más
+     reciente, añadido por nuestro propio proxy) en vez del primero.
+  3. Sólo si nada de lo anterior está, usamos `request.client.host`.
+
+Si el backend se expusiera directamente al host (sin proxy), habría que
+deshabilitar esta lógica o validar contra una lista de proxies confiables
+vía Starlette `ProxiedHeadersMiddleware` o `forwarded_allow_ips` de uvicorn.
+"""
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from starlette.requests import Request
+
+from app.core.config import settings
+
+
+def client_ip_key(request: Request) -> str:
+    """IP real del cliente. Ver docstring del módulo para la política completa."""
+    # 1. X-Real-IP — nginx la sobreescribe con la IP del peer (Caddy). Confiable.
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+
+    # 2. X-Forwarded-For: tomar el ÚLTIMO valor (el añadido por el proxy más
+    # cercano al backend), no el primero. Cualquier "primer valor" puede haber
+    # sido inyectado por el cliente.
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+
+    # 3. Fallback: peer directo.
+    return get_remote_address(request)
+
+
+def rate_limit_key(request: Request) -> str:
+    """
+    Clave del límite de peticiones: el USUARIO si la petición trae un token de
+    acceso válido; si no (login, recursos públicos), la IP real.
+
+    Contar por IP hacía que toda una oficina detrás de un NAT (o de un proxy
+    corporativo) compartiera el mismo cupo: la pantalla de Activos quedaba
+    vacía para todos cuando unos pocos buscaban a la vez (QA1 UI-07). La firma
+    del token se verifica, así que no se puede agotar el cupo de otro usuario.
+    """
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        import jwt as _jwt
+        from jwt import PyJWTError as JWTError
+        try:
+            payload = _jwt.decode(auth[7:].strip(), settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+            if payload.get("type") == "access" and payload.get("sub"):
+                return f"user:{payload['sub']}"
+        except JWTError:
+            pass
+    return client_ip_key(request)
+
+
+def limiter_options(redis_url: str | None) -> dict:
+    options = {
+        "key_func": rate_limit_key,
+        "default_limits": [settings.RATE_LIMIT_DEFAULT],
+    }
+    if redis_url:
+        options.update(
+            {
+                "storage_uri": redis_url,
+                # Limits conmuta a un limiter en memoria por worker cuando
+                # Redis no responde. El negocio sigue operativo, aunque el
+                # límite deja de ser global hasta que Redis se recupere.
+                "in_memory_fallback_enabled": True,
+                "swallow_errors": True,
+            }
+        )
+    return options
+
+
+limiter = Limiter(**limiter_options(settings.REDIS_URL))

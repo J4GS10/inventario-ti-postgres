@@ -1,0 +1,82 @@
+# Integración continua de Inventario-TI.
+# Cada push y cada pull request ejecutan:
+#   - backend: la suite completa contra PostgreSQL 16 (con RLS real) y el
+#     chequeo de migraciones lineales (una sola cabeza de Alembic);
+#   - frontend: TypeScript, ESLint, build de producción y verificación de las
+#     traducciones (mismas claves en ES/EN/IT, sin claves faltantes).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: inventarioTI-backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: t
+          POSTGRES_PASSWORD: t
+          POSTGRES_DB: t
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U t -d t"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://t:t@localhost:5432/t
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: inventarioTI-backend/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Migraciones lineales (una sola cabeza)
+        env:
+          POSTGRES_SERVER: localhost
+          POSTGRES_USER: t
+          POSTGRES_PASSWORD: t
+          POSTGRES_DB: t
+          SECRET_KEY: ci-only-secret-key-not-used-anywhere-else-0123456789
+        run: |
+          heads=$(alembic heads | wc -l)
+          echo "Cabezas de Alembic: $heads"
+          test "$heads" -eq 1
+      - name: Pruebas (PostgreSQL 16)
+        run: python -m pytest tests/ -q -p no:warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: inventarioTI-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: inventarioTI-frontend/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+      - run: npx tsc -b
+      - run: npx eslint src
+      - run: npm run build
+      - name: Traducciones ES/EN/IT
+        run: python ../herramientas-qa/verify.py
+        env:
+          PYTHONIOENCODING: utf-8

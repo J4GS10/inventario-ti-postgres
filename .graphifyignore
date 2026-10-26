@@ -1,0 +1,24 @@
+# Dependencias, compilados y cachés
+node_modules/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+*.pyc
+package-lock.json
+lint-report.json
+# Datos reales de inventario (no es código)
+dataset/
+# Capturas y salidas de QA
+herramientas-qa/shots/
+*.png
+*.jpg
+graphify-out/
+# Secretos y datos operativos: nunca entran al grafo
+.env*
+**/.env
+inventarioTI-backend/deploy/backups/
+inventarioTI-backend/deploy/replica/
+inventarioTI-backend/deploy/backup/rclone.conf
+herramientas-qa/salidas/
+*.dmp

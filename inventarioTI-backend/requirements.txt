@@ -1,0 +1,77 @@
+# =========================================================================
+# Runtime
+# =========================================================================
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+gunicorn>=21.2.0
+
+# =========================================================================
+# DB
+# =========================================================================
+# [asyncio] trae greenlet (desde 2.1 ya no viene por defecto) y <2.1 fija la
+# serie probada: una actualización mayor sin probar rompió el build del migrator.
+sqlalchemy[asyncio]>=2.0.25,<2.1
+alembic>=1.13.1
+psycopg[binary,pool]>=3.1.18
+aiosqlite>=0.20.0
+
+# =========================================================================
+# Validation / Settings
+# =========================================================================
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+email-validator>=2.1.0.post1
+python-multipart>=0.0.9
+
+# =========================================================================
+# Auth & Security
+# =========================================================================
+# PyJWT reemplaza a python-jose (sin mantenimiento activo: PYSEC-2026-4298,
+# confusión de algoritmo sin versión corregida; arrastraba `ecdsa`, Minerva).
+# [crypto] trae RSA/EC para los id_token del SSO. 2.10 valida sub/jti.
+PyJWT[crypto]>=2.10.1,<3
+passlib[argon2,bcrypt]>=1.7.4
+bcrypt==4.0.1
+cryptography>=43.0.0
+slowapi>=0.1.9
+redis>=5.0.0
+limits[redis]>=3.13.0
+aiosmtplib>=3.0.0
+# Active Directory (LDAP) — directorio de personas y grupos de notificación
+ldap3>=2.9.1
+jinja2>=3.1.0
+# Importación de activos desde Excel (.xlsx)
+openpyxl>=3.1.2
+
+# =========================================================================
+# Observability / Logging
+# =========================================================================
+structlog>=24.1.0
+boto3>=1.34.0
+
+# =========================================================================
+# Documentos (actas de entrega en Word .docx y PDF, con logo de empresa)
+# =========================================================================
+python-docx>=0.8.11
+reportlab>=4.1.0
+pillow>=10.3.0
+httpx>=0.27.0  # descarga del logo configurado (runtime, no solo tests)
+
+# =========================================================================
+# 2FA / MFA (autenticación de dos factores)
+# =========================================================================
+pyotp>=2.9.0        # TOTP (RFC 6238) para apps autenticadoras
+qrcode>=7.4.2       # QR de enrolamiento TOTP (usa pillow, ya presente)
+
+# =========================================================================
+# Testing (dev)
+# =========================================================================
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pypdf>=4.0.0  # tests: extracción de texto de las actas PDF (test_report_translations)
+httpx>=0.27.0
+# Auditoría de vulnerabilidades de dependencias (correr en CI):
+#   pip-audit -r requirements.txt
+pip-audit>=2.7.0
+ruff>=0.8.0
+tzdata>=2024.1  # zona horaria de la organización también en imágenes mínimas

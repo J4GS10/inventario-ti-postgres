@@ -1,0 +1,487 @@
+# =========================================================================
+# Stack completo de despliegue (repos separados):
+#   Postgres + Redis + Backend (FastAPI/gunicorn) + Frontend (Nginx) + Caddy.
+#
+# LAYOUT ESPERADO (los dos repos como hermanos):
+#   <parent>/
+#   ├── inventario-ti-backend/    (este repo; compose en deploy/)
+#   └── inventario-ti-frontend/   (git clone hermano)
+#
+# USO (desde inventario-ti-backend/deploy):
+#   1. cp .env.example .env  &&  edita los secretos (ver DEPLOYMENT.md)
+#   2. docker compose up -d --build
+#   3. DOMAIN=localhost  -> https://localhost (cert autofirmado)
+#      DOMAIN=tu.dominio -> Let's Encrypt automático (puertos 80/443 abiertos)
+#
+# Red: solo Caddy expone 80/443. Dos redes:
+#   internal (internal: true, sin salida a Internet): Postgres, Redis, MinIO,
+#            migrador, respaldos y backend. Nada de esta red es alcanzable
+#            desde fuera ni puede abrir conexiones hacia fuera (sin telemetría).
+#   salida   Caddy, frontend y backend: Let's Encrypt, SMTP, AD y SSO.
+#
+# Logs: json-file con rotación (LOG_MAX_SIZE × LOG_MAX_FILE por contenedor,
+# por defecto 10 MB × 5, comprimidos).
+# =========================================================================
+
+x-logs: &logs
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILE:-5}"
+    compress: "true"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "hba_file=/etc/postgresql/pg_hba.conf"
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  db_replication_init:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPLICATION_USER: ${POSTGRES_REPLICATION_USER:-replicator}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres/init-replication.sh:/usr/local/bin/init-replication.sh:ro
+    command: ["sh", "/usr/local/bin/init-replication.sh"]
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+
+  db_report:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPLICATION_USER: ${POSTGRES_REPLICATION_USER:-replicator}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-}
+    volumes:
+      - postgres_report_data:/var/lib/postgresql/data
+      - ./postgres/start-replica.sh:/usr/local/bin/start-replica.sh:ro
+    command: ["sh", "/usr/local/bin/start-replica.sh"]
+    depends_on:
+      db: { condition: service_healthy }
+      db_replication_init: { condition: service_completed_successfully }
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - "redis-server"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+      - "--maxmemory"
+      - "128mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--requirepass"
+      - "${REDIS_PASSWORD}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD --no-auth-warning ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e  # RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # Clave maestra para el cifrado en reposo (SSE-S3) de los adjuntos.
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio_init:
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727  # RELEASE.2025-08-13T08-35-41Z
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_APP_USER: ${MINIO_APP_USER}
+      MINIO_APP_PASSWORD: ${MINIO_APP_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-lombardi-adjuntos}
+      MINIO_VERSIONS_RETENTION_DAYS: ${MINIO_VERSIONS_RETENTION_DAYS:-90}
+    # Bucket privado, versionado (un borrado no elimina el binario: queda la
+    # versión anterior durante MINIO_VERSIONS_RETENTION_DAYS), cifrado en
+    # reposo y un usuario de servicio limitado a ese bucket para el backend.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set lombardi http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "lombardi/$$S3_BUCKET"
+        mc version enable "lombardi/$$S3_BUCKET"
+        mc ilm rule ls "lombardi/$$S3_BUCKET" 2>/dev/null | grep -q NoncurrentVersionExpiration           || mc ilm rule add --noncurrent-expire-days "$$MINIO_VERSIONS_RETENTION_DAYS" "lombardi/$$S3_BUCKET"
+        mc encrypt set sse-s3 "lombardi/$$S3_BUCKET"
+        cat > /tmp/politica.json <<POLITICA
+        {"Version":"2012-10-17","Statement":[
+          {"Effect":"Allow","Action":["s3:GetBucketLocation","s3:ListBucket"],"Resource":["arn:aws:s3:::$$S3_BUCKET"]},
+          {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::$$S3_BUCKET/*"]}
+        ]}
+        POLITICA
+        mc admin policy create lombardi inventario-adjuntos /tmp/politica.json
+        mc admin user add lombardi "$$MINIO_APP_USER" "$$MINIO_APP_PASSWORD"
+        mc admin policy attach lombardi inventario-adjuntos --user "$$MINIO_APP_USER" 2>/dev/null || true
+        echo "MinIO listo: bucket privado, versionado, cifrado y usuario de servicio."
+    depends_on:
+      minio: { condition: service_healthy }
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+
+  # MailHog (solo dev): captura SMTP, UI en :8025. `docker compose --profile dev up -d`
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    profiles: ["dev"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:8025:8025"]
+    networks: [internal, salida]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+
+  migrator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: "no"
+    entrypoint: ["/app/migrator.sh"]
+    environment:
+      ENVIRONMENT: production
+      DB_ENGINE: ${DB_ENGINE:-postgres}
+      DB_WRITE_DSN: ${DB_WRITE_DSN:-}
+      DB_WRITE_HOST: ${DB_WRITE_HOST:-db}
+      POSTGRES_SERVER: ${DB_WRITE_HOST:-db}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PORT: 5432
+      SECRET_KEY: ${SECRET_KEY}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY}
+      SUPER_ADMIN_USERNAME: ${SUPER_ADMIN_USERNAME:-sa}
+      SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL:-admin@example.com}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD}
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+  backend:
+    build:
+      context: ..                       # raíz del repo inventario-ti-backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PROJECT_NAME: ${PROJECT_NAME:-Sistema Inventario TI}
+      ENVIRONMENT: production
+      DEBUG: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DB_ENGINE: ${DB_ENGINE:-postgres}
+      DB_WRITE_DSN: ${DB_WRITE_DSN:-}
+      DB_READ_DSN: ${DB_READ_DSN:-}
+      DB_WRITE_HOST: ${DB_WRITE_HOST:-db}
+      DB_READ_HOST: ${DB_READ_HOST:-db_report}
+      POSTGRES_SERVER: ${DB_WRITE_HOST:-db}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PORT: 5432
+      POSTGRES_REPLICA_SERVER: ${POSTGRES_REPLICA_SERVER:-db_report}
+      POSTGRES_REPLICA_USER: ${POSTGRES_REPLICA_USER:-${POSTGRES_USER}}
+      POSTGRES_REPLICA_PASSWORD: ${POSTGRES_REPLICA_PASSWORD:-${POSTGRES_PASSWORD}}
+      POSTGRES_REPLICA_DB: ${POSTGRES_REPLICA_DB:-${POSTGRES_DB}}
+      POSTGRES_REPLICA_PORT: ${POSTGRES_REPLICA_PORT:-5432}
+      DB_READ_POOL_SIZE: ${DB_READ_POOL_SIZE:-10}
+      DB_READ_MAX_OVERFLOW: ${DB_READ_MAX_OVERFLOW:-20}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-5}
+      DB_FAILOVER_PROBE_RETRIES: ${DB_FAILOVER_PROBE_RETRIES:-1}
+      DB_FAILOVER_RETRY_DELAY_SECONDS: ${DB_FAILOVER_RETRY_DELAY_SECONDS:-0.25}
+      DB_REPLICA_CHECK_TIMEOUT_SECONDS: ${DB_REPLICA_CHECK_TIMEOUT_SECONDS:-2}
+      DB_REPLICA_LAG_WARNING_SECONDS: ${DB_REPLICA_LAG_WARNING_SECONDS:-5}
+      DB_REPLICA_LAG_CRITICAL_SECONDS: ${DB_REPLICA_LAG_CRITICAL_SECONDS:-30}
+      DB_ECHO: "false"
+      SECRET_KEY: ${SECRET_KEY}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-30}
+      ACCOUNT_LOCKOUT_THRESHOLD: ${ACCOUNT_LOCKOUT_THRESHOLD:-5}
+      ACCOUNT_LOCKOUT_MINUTES: ${ACCOUNT_LOCKOUT_MINUTES:-15}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-10}
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-["http://localhost","https://localhost"]}
+      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-5/minute}
+      RATE_LIMIT_REFRESH: ${RATE_LIMIT_REFRESH:-10/minute}
+      RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-100/minute}
+      PAGINATION_MAX_LIMIT: ${PAGINATION_MAX_LIMIT:-200}
+      REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379/0}
+      AUTH_CACHE_TTL_SECONDS: ${AUTH_CACHE_TTL_SECONDS:-30}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_TLS: ${SMTP_TLS:-true}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+      SMTP_TIMEOUT_SECONDS: ${SMTP_TIMEOUT_SECONDS:-10}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-noreply@lombardi.local}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Sistema Inventario Lombardi}
+      NOTIFY_ADMIN_EMAILS: ${NOTIFY_ADMIN_EMAILS:-}
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY}
+      SUPER_ADMIN_USERNAME: ${SUPER_ADMIN_USERNAME:-sa}
+      SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL:-admin@example.com}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD}
+      # PRODUCCIÓN: déjalo en false. El seed mínimo canónico corre SIEMPRE
+      # (estados/tipos), sin data de demo.
+      SEED_DEMO: ${SEED_DEMO:-false}
+      UPLOAD_DIR: ${UPLOAD_DIR:-/app/uploads}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      # Usuario de servicio con permisos solo sobre el bucket (creado por minio_init).
+      S3_ACCESS_KEY: ${MINIO_APP_USER}
+      S3_SECRET_KEY: ${MINIO_APP_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-lombardi-adjuntos}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      STORAGE_TIMEOUT_SECONDS: ${STORAGE_TIMEOUT_SECONDS:-5}
+      # Sesiones (ver DEPLOYMENT.md §4.2). La inactividad del frontend
+      # (VITE_SESSION_IDLE_TIMEOUT_MINUTES) debe coincidir.
+      SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-120}
+      SESSION_ABSOLUTE_MAX_HOURS: ${SESSION_ABSOLUTE_MAX_HOURS:-12}
+      REFRESH_REUSE_GRACE_SECONDS: ${REFRESH_REUSE_GRACE_SECONDS:-30}
+      REFRESH_COOKIE_PERSISTENT: ${REFRESH_COOKIE_PERSISTENT:-false}
+      # Cola persistente de correos
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-7}
+      OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-15}
+      OUTBOX_RETENTION_DAYS: ${OUTBOX_RETENTION_DAYS:-30}
+      # Active Directory (ver DEPLOYMENT.md §4.1)
+      AD_ENABLED: ${AD_ENABLED:-false}
+      AD_SERVER: ${AD_SERVER:-}
+      AD_START_TLS: ${AD_START_TLS:-false}
+      AD_VERIFY_CERT: ${AD_VERIFY_CERT:-true}
+      AD_CA_CERT_FILE: ${AD_CA_CERT_FILE:-}
+      AD_BIND_USER: ${AD_BIND_USER:-}
+      AD_BIND_PASSWORD: ${AD_BIND_PASSWORD:-}
+      AD_BASE_DN: ${AD_BASE_DN:-}
+      AD_GROUP_BASE_DN: ${AD_GROUP_BASE_DN:-}
+      AD_ADMIN_GROUP: ${AD_ADMIN_GROUP:-}
+      AD_SYNC_INTERVAL_MINUTES: ${AD_SYNC_INTERVAL_MINUTES:-0}
+      AD_SYNC_DEACTIVATE: ${AD_SYNC_DEACTIVATE:-true}
+    volumes:
+      - adjuntos_data:/app/uploads
+    depends_on:
+      migrator: { condition: service_completed_successfully }
+      minio_init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [internal, salida]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      # Repo hermano del frontend (ajustable si la carpeta se llama distinto).
+      context: ${FRONTEND_CONTEXT:-../../inventario-ti-frontend}
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api/v1
+        VITE_SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-120}
+    restart: unless-stopped
+    depends_on:
+      backend: { condition: service_healthy }
+    networks: [salida]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --spider --tries=1 http://127.0.0.1/healthz || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend: { condition: service_healthy }
+    networks: [salida]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 256
+
+  # Respaldos automáticos (ver DEPLOYMENT.md §6). Los archivos quedan en
+  # BACKUP_DIR (por defecto deploy/backups): cópielos fuera del servidor.
+  backup_db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/backup/respaldo_db.sh"]
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ./backup:/backup:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+
+  backup_minio:
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727  # RELEASE.2025-08-13T08-35-41Z
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/backup/respaldo_minio.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-lombardi-adjuntos}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+    volumes:
+      - ./backup:/backup:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    depends_on:
+      minio_init: { condition: service_completed_successfully }
+    networks: [internal]
+    logging: *logs
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+
+  # Réplica de BACKUP_DIR fuera del servidor (otro disco, NAS, otro equipo o un
+  # remoto rclone). Se activa con COMPOSE_PROFILES=replica en .env.
+  backup_replica:
+    image: rclone/rclone:1.68.2
+    profiles: ["replica"]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/config/replicar.sh"]
+    environment:
+      BACKUP_REPLICA_REMOTE: ${BACKUP_REPLICA_REMOTE:-}
+      BACKUP_REPLICA_INTERVAL_SECONDS: ${BACKUP_REPLICA_INTERVAL_SECONDS:-60}
+      BACKUP_REPLICA_RETENTION_DAYS: ${BACKUP_REPLICA_RETENTION_DAYS:-30}
+    volumes:
+      - ./backup:/config:ro
+      - ${BACKUP_DIR:-./backups}:/origen:ro
+      - ${BACKUP_REPLICA_DIR:-./replica}:/replica
+    healthcheck:
+      test: ["CMD-SHELL", "test $$(( $$(date -u +%s) - $$(cat /tmp/ultimo_ok 2>/dev/null || echo 0) )) -lt 900"]
+      interval: 2m
+      timeout: 5s
+      start_period: 5m
+    # Sin la red interna: solo necesita el disco y, si hay remoto, salida a la red.
+    security_opt: ["no-new-privileges:true"]
+    logging: *logs
+    mem_limit: 256m
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  salida:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  postgres_report_data:
+  caddy_data:
+  caddy_config:
+  adjuntos_data:
+  minio_data:

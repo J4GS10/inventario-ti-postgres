@@ -1,0 +1,268 @@
+"""Dependencias FastAPI compartidas: auth, RBAC, paginación."""
+from __future__ import annotations
+
+from typing import Annotated, Literal
+from fastapi import Depends, HTTPException, Query, Request, status
+from fastapi.security import OAuth2PasswordBearer
+import jwt
+from jwt import ExpiredSignatureError, PyJWTError as JWTError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.cache import cache_delete, cache_get, cache_set
+from app.core.config import settings
+from app.db.session import get_db
+from app.models.organization import Usuario
+from app.repositories.governance import GovernanceRepository
+from app.repositories.organization import UsuarioRepository
+
+reusable_oauth2 = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/login/access-token"
+)
+
+
+def _decode_token(token: str, expected_type: Literal["access", "refresh"] = "access") -> dict:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="TOKEN_EXPIRED",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="COULD_NOT_VALIDATE_CREDENTIALS",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if payload.get("type") != expected_type:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="INVALID_TOKEN_TYPE",
+        )
+
+    if not payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="COULD_NOT_VALIDATE_CREDENTIALS",
+        )
+    return payload
+
+
+async def _authenticate(db: AsyncSession, token: str, *, allow_restricted: bool) -> Usuario:
+    """
+    Resuelve y valida el usuario del token JWT. Aplica caché en Redis
+    cuando está disponible: el resultado se cachea por TTL corto (default 30s)
+    bajo la clave 'auth:jti:{jti}'. La caché se invalida automáticamente:
+      - por TTL,
+      - cuando el JTI se revoca (logout) -> revocación grabada en BD,
+      - cuando hay revocación global -> validamos contra is_user_globally_revoked
+        siempre, incluso en cache hit (cuesta una query barata pero garantiza
+        que un cambio de password invalide inmediatamente todos los tokens).
+    """
+    payload = _decode_token(token, expected_type="access")
+    # Sesión restringida (contraseña temporal o MFA pendiente): solo se admite
+    # en los endpoints de autoservicio. Seguro por defecto: todo lo demás, 403.
+    from app.services.session_policy import restriction_error
+    pending = restriction_error(payload)
+    if pending and not allow_restricted:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=pending)
+    username = payload["sub"]
+    jti = payload.get("jti")
+    iat = payload.get("iat")
+
+    gov_repo = GovernanceRepository(db)
+
+    # 1. Revocación individual (logout) — chequeo barato si está cacheado el resultado.
+    cache_key = f"auth:jti:{jti}" if jti else None
+    cached = await cache_get(cache_key) if cache_key else None
+
+    if cached and cached.get("revoked"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="TOKEN_REVOKED"
+        )
+
+    if not cached:
+        if jti and await gov_repo.is_jti_revoked(jti):
+            # Cachear el "revocado" para evitar query repetida en el TTL.
+            if cache_key:
+                await cache_set(cache_key, {"revoked": True}, settings.AUTH_CACHE_TTL_SECONDS)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="TOKEN_REVOKED"
+            )
+
+    # 2. Usuario — desde caché si lo tenemos, si no cargamos.
+    user: Usuario | None = None
+    if cached and cached.get("username"):
+        repo = UsuarioRepository(db)
+        user = await repo.get_by_username(username=cached["username"])
+    else:
+        repo = UsuarioRepository(db)
+        user = await repo.get_by_username(username=username)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="COULD_NOT_VALIDATE_CREDENTIALS"
+        )
+
+    if not user.USU_Estado:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INACTIVE_USER")
+
+    # 3. Revocación global SIEMPRE se valida (no se cachea como "ok"), para que un
+    #    cambio de password o offboarding tenga efecto inmediato.
+    if iat:
+        from app.core.security import token_issued_at
+        issued_at = token_issued_at(payload)
+        if await gov_repo.is_user_globally_revoked(user.USU_Usuario, issued_at):
+            # Marcar revocado en caché para próximos hits del mismo jti.
+            if cache_key:
+                await cache_set(cache_key, {"revoked": True}, settings.AUTH_CACHE_TTL_SECONDS)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="TOKEN_REVOKED"
+            )
+
+    # 4. Sesión cerrada individualmente (desde "Sesiones activas").
+    sid = payload.get("sid")
+    if sid:
+        from app.services.sessions import is_session_closed
+        if await is_session_closed(db, sid):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="TOKEN_REVOKED"
+            )
+
+    # Cachear "válido" si no estaba.
+    if cache_key and not cached:
+        await cache_set(
+            cache_key,
+            {"revoked": False, "username": user.USU_Username},
+            settings.AUTH_CACHE_TTL_SECONDS,
+        )
+
+    # 5. Alcance de datos (RLS por sede) para el resto de la petición.
+    from app.core.data_scope import scope_for_user, set_request_scope
+    set_request_scope(scope_for_user(user))
+    return user
+
+
+async def get_current_user(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(reusable_oauth2),
+) -> Usuario:
+    user = await _authenticate(db, token, allow_restricted=False)
+    # El rol queda en la petición: el middleware ocultar_costos lo usa para
+    # quitar costos y montos de la respuesta a TECNICO y CONSULTA.
+    request.state.rol = user.USU_Rol
+    return user
+
+
+async def get_current_user_allow_restricted(
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(reusable_oauth2),
+) -> Usuario:
+    """Solo para autoservicio: /me, /me/password y /me/2fa/*."""
+    return await _authenticate(db, token, allow_restricted=True)
+
+
+async def invalidate_auth_cache(*jtis: str) -> None:
+    """Útil al hacer logout: borra entradas específicas para no esperar TTL."""
+    keys = [f"auth:jti:{j}" for j in jtis if j]
+    if keys:
+        await cache_delete(*keys)
+
+
+CurrentUser = Annotated[Usuario, Depends(get_current_user)]
+# Admite sesiones con un paso de seguridad pendiente (cambio de contraseña/MFA).
+CurrentUserSelfService = Annotated[Usuario, Depends(get_current_user_allow_restricted)]
+
+
+class RoleChecker:
+    """
+    Dependencia que valida que el usuario tenga uno de los roles permitidos.
+
+    Uso:
+        require_admin = RoleChecker(["SUPER_ADMIN", "ADMIN_TI"])
+        @router.post("/...", dependencies=[Depends(require_admin)])
+    """
+
+    def __init__(self, allowed_roles: list[str]):
+        self.allowed_roles = set(allowed_roles)
+
+    def __call__(self, user: Usuario = Depends(get_current_user)) -> Usuario:
+        if user.USU_Rol not in self.allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="NOT_ENOUGH_PERMISSIONS",
+            )
+        return user
+
+
+# Atajos comunes
+require_super_admin = RoleChecker(["SUPER_ADMIN"])
+# Gestión de identidades y accesos (usuarios, contraseñas, MFA, sesiones).
+require_iam = RoleChecker(["SUPER_ADMIN", "ADMIN_SEGURIDAD"])
+# Módulos de inventario/operación (todos los roles salvo ADMIN_SEGURIDAD).
+require_business = RoleChecker(["SUPER_ADMIN", "JEFE_TI", "ADMIN_TI", "TECNICO", "AUDITOR", "CONSULTA"])
+require_admin = RoleChecker(["SUPER_ADMIN", "JEFE_TI", "ADMIN_TI"])
+require_operativo = RoleChecker(["SUPER_ADMIN", "JEFE_TI", "ADMIN_TI", "TECNICO"])
+# Aprobación de bajas y sobrantes (separación de funciones: ver services/aprobaciones.py).
+require_aprobador = RoleChecker(["SUPER_ADMIN", "JEFE_TI"])
+# Lectura de la bitácora de auditoría (el AUDITOR la ve filtrada por su alcance).
+require_audit_reader = RoleChecker(["SUPER_ADMIN", "ADMIN_SEGURIDAD", "AUDITOR"])
+# Exportaciones CSV del inventario (lectura masiva de su alcance).
+require_export = RoleChecker(["SUPER_ADMIN", "JEFE_TI", "ADMIN_TI", "AUDITOR"])
+# Grupos por módulo (definidos en app/core/roles.py).
+from app.core import roles as _roles  # noqa: E402
+require_app = RoleChecker(list(_roles.APP_ROLES))
+require_inventory = RoleChecker(list(_roles.INVENTORY_READ_ROLES))
+require_stock_read = RoleChecker(list(_roles.STOCK_READ_ROLES))
+require_stock_catalog = RoleChecker(list(_roles.STOCK_READ_ROLES) + ["COMPRAS"])
+require_people = RoleChecker(list(_roles.PEOPLE_READ_ROLES))
+require_people_or_iam = RoleChecker(list(_roles.PEOPLE_READ_ROLES) + ["ADMIN_SEGURIDAD"])
+require_software = RoleChecker(list(_roles.SOFTWARE_READ_ROLES))
+require_purchase = RoleChecker(list(_roles.PURCHASE_WRITE_ROLES))
+require_purchase_read = RoleChecker(list(_roles.PURCHASE_READ_ROLES))
+require_control_read = RoleChecker(list(_roles.CONTROL_READ_ROLES))
+require_finance_export = RoleChecker(list(_roles.FINANCE_EXPORT_ROLES))
+require_purchase_export = RoleChecker(list(_roles.FINANCE_EXPORT_ROLES) + ["COMPRAS"])
+# Cualquier autenticado: usar Depends(get_current_user) directamente.
+
+
+# =========================================================================
+# PAGINACIÓN
+# =========================================================================
+class PaginationParams:
+    """Cota superior fija de paginación para evitar abusos."""
+
+    def __init__(
+        self,
+        skip: int = Query(0, ge=0, description="Items a omitir"),
+        limit: int = Query(50, ge=1, le=settings.PAGINATION_MAX_LIMIT, description="Items a retornar"),
+    ):
+        self.skip = skip
+        self.limit = limit
+
+
+# =========================================================================
+# CONTEXTO DE REQUEST (para auditoría)
+# =========================================================================
+def get_client_ip(request: Request) -> str | None:
+    """
+    IP real para auditoría. Misma política que el rate-limiter
+    (ver `app/core/limiter.py`) — X-Real-IP > último hop de XFF > peer.
+    """
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+    return request.client.host if request.client else None
+
+
+def get_user_agent(request: Request) -> str | None:
+    ua = request.headers.get("user-agent")
+    return ua[:255] if ua else None

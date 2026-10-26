@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+.env
+.env.*
+!.env.example
+
+# Bases de datos locales
+*.db
+*.sqlite
+*.sqlite3
+inventario.db
+
+# Logs
+*.log
+logs/
+logs.txt
+bootstrap.log
+bootstrap_error.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Docker
+postgres_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Migraciones temporales / dumps
+*.sql.bak
+*.dump
